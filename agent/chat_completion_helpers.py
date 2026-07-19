@@ -1961,6 +1961,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # turn's restore_primary_runtime stays gated instead of resetting
         # _fallback_index=0 and re-marshaling the whole context across every
         # provider again.  Guards the cross-turn replay storm in #24996.
+        logger.warning(
+            "Fallback chain exhausted (index=%s chain_len=%s reason=%s current=%s/%s)",
+            agent._fallback_index,
+            len(agent._fallback_chain),
+            getattr(reason, "name", reason),
+            getattr(agent, "provider", "?"),
+            getattr(agent, "model", "?"),
+        )
         if (
             len(agent._fallback_chain) > 0
             and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
@@ -1979,7 +1987,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         unavailable = set()
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
-        logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
+        logger.warning(
+            "Fallback skip: %s previously marked unavailable (index=%s)",
+            fb_key, agent._fallback_index - 1 if agent._fallback_index else 0,
+        )
         return agent._try_activate_fallback(reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
@@ -3993,6 +4004,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
         return final_message
 
+    # Shared with poll-loop stale kill: force outer failover (no stream retries).
+    _force_failover_no_retry = {"yes": False}
+
     def _call():
         import httpx as _httpx
 
@@ -4035,19 +4049,41 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # InterruptedError. This is the fix for the cascading-
                     # interrupt hang where doomed retries burned full
                     # stream-stale-timeout cycles. (#6600)
-                    if _request_cancelled["value"]:
+                    if _request_cancelled["value"] and not _force_failover_no_retry.get("yes"):
                         logger.debug(
                             "Streaming worker caught %s after request "
                             "cancellation — exiting without retry.",
                             type(e).__name__,
                         )
                         return
+                    # Forced TTFB failover: surface the error even if cancel was set
+                    if _force_failover_no_retry.get("yes") and not deltas_were_sent["yes"]:
+                        logger.info(
+                            "Pre-first-token forced failover — propagating %s to outer loop",
+                            type(e).__name__,
+                        )
+                        result["error"] = e if e is not None else TimeoutError(
+                            "pre-first-token stale timeout; failing over"
+                        )
+                        return
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
+                    # OpenAI SDK wrappers (name-based) — logs show ReadTimeout but
+                    # some paths raise APITimeoutError / APIConnectionError.
+                    _ename = type(e).__name__
+                    if not _is_timeout and _ename in {
+                        "APITimeoutError", "TimeoutError", "ReadTimeout",
+                    }:
+                        _is_timeout = True
                     _is_conn_err = isinstance(
                         e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                     )
+                    if not _is_conn_err and _ename in {
+                        "APIConnectionError", "ConnectError", "RemoteProtocolError",
+                        "ServerDisconnectedError",
+                    }:
+                        _is_conn_err = True
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
@@ -4056,15 +4092,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # max_num_seqs full) or an intentional stale-stream kill — not
                     # flaky TCP. Reconnecting to the same overloaded engine 3× just
                     # burns wall-clock and never reaches fallback_providers.
+                    _pending_fb = False
+                    try:
+                        _pending_fb = bool(agent._has_pending_fallback())
+                    except Exception:
+                        _pending_fb = False
                     if (
-                        (_is_timeout or _is_conn_err)
+                        (_is_timeout or _is_conn_err or _force_failover_no_retry.get("yes"))
                         and not deltas_were_sent["yes"]
-                        and agent._has_pending_fallback()
+                        and _pending_fb
                     ):
                         logger.info(
-                            "Pre-first-token %s with fallback chain available — "
-                            "skipping stream retries so outer loop can fail over",
+                            "Pre-first-token %s with fallback chain available "
+                            "(index=%s chain=%s) — skipping stream retries so outer "
+                            "loop can fail over",
                             type(e).__name__,
+                            getattr(agent, "_fallback_index", "?"),
+                            len(getattr(agent, "_fallback_chain", None) or []),
                         )
                         result["error"] = e
                         return
@@ -4343,20 +4387,28 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 else "stream_error_cleanup"
             )
 
-    # Provider-configured stale timeout takes priority over env default.
-    # When the operator set an EXPLICIT provider/model stale_timeout_seconds
-    # (e.g. DeepSeek queue tripwire of 5s), honor it as a hard value — do NOT
-    # raise it via large-context scaling or the reasoning-model floor. Those
-    # floors exist to protect default 180s chat thresholds; applying them on
-    # top of an intentional short tripwire defeats capacity overflow fallback
-    # (deepseek-v4-flash alone carries a 600s reasoning floor).
+    # Provider-configured stale timeout.
+    # Explicit stale_timeout_seconds is a QUEUE/TTFB tripwire (no first token).
+    # It must NOT also kill mid-stream reasoning pauses (Nemotron routinely
+    # pauses >45s while thinking). Split:
+    #   _ttfb_stale_timeout  — pre-first-token only (explicit config, hard)
+    #   _stream_stale_timeout — mid-stream idle (long; request_timeout or 180+)
     _cfg_stale = get_provider_stale_timeout(
         agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
     )
+    _cfg_request = get_provider_request_timeout(
+        agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
+    )
+    _ttfb_stale_timeout = None  # None → use mid-stream threshold for TTFB too
     if _cfg_stale is not None:
-        _stream_stale_timeout = _cfg_stale
+        _ttfb_stale_timeout = _cfg_stale
+        # Mid-stream: prefer request_timeout if longer, else ≥180s so reasoning
+        # models aren't murdered by the queue tripwire.
+        _mid = _cfg_request if _cfg_request is not None else 180.0
+        _stream_stale_timeout = max(float(_mid), 180.0, float(_cfg_stale))
         logger.debug(
-            "Using explicit provider stale_timeout_seconds=%.0fs (no context/reasoning floor)",
+            "Explicit stale=%.0fs is TTFB-only; mid-stream stale=%.0fs",
+            _ttfb_stale_timeout,
             _stream_stale_timeout,
         )
     else:
@@ -4450,11 +4502,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # so CLI/TUI/Desktop users see WHAT the wait is (slow or
                 # overloaded provider / long thinking pause) instead of an
                 # unexplained generic spinner, and WHEN recovery kicks in.
+                _active_stale = (
+                    _ttfb_stale_timeout
+                    if (
+                        _ttfb_stale_timeout is not None
+                        and not first_delta_fired["done"]
+                        and not deltas_were_sent["yes"]
+                    )
+                    else _stream_stale_timeout
+                )
                 if (
-                    _stream_stale_timeout is not None
-                    and _stream_stale_timeout != float("inf")
+                    _active_stale is not None
+                    and _active_stale != float("inf")
                 ):
-                    _recovery = f"; auto-reconnect at {int(_stream_stale_timeout)}s"
+                    _recovery = f"; auto-reconnect at {int(_active_stale)}s"
                 else:
                     _recovery = ""
                 agent._emit_wait_notice(
@@ -4471,16 +4532,54 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the
-        # inner retry loop can start a fresh connection.
+        # inner retry loop can start a fresh connection — OR escalate
+        # to provider fallback when this is still pre-first-token and
+        # a fallback chain is available (capacity overflow path).
         _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        _pre_first = (not first_delta_fired["done"]) and (not deltas_were_sent["yes"])
+        _active_stale = (
+            _ttfb_stale_timeout
+            if (_ttfb_stale_timeout is not None and _pre_first)
+            else _stream_stale_timeout
+        )
+        if _active_stale is not None and _stale_elapsed > _active_stale:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
+            _phase = "ttfb" if _pre_first else "mid-stream"
             logger.warning(
-                "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                "Stream stale for %.0fs (threshold %.0fs, phase=%s) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",
-                _stale_elapsed, _stream_stale_timeout,
+                _stale_elapsed, _active_stale, _phase,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
+            # Pre-first-token + pending fallback → fail over, do not reconnect
+            # to the same overloaded engine.
+            if _pre_first and agent._has_pending_fallback():
+                logger.info(
+                    "Pre-first-token stale kill with fallback chain available — "
+                    "forcing failover (skip stream retries)"
+                )
+                _force_failover_no_retry["yes"] = True
+                agent._buffer_status(
+                    f"⚠️ No first token in {int(_stale_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Failing over…"
+                )
+                try:
+                    _close_request_client_once("stale_stream_kill_failover")
+                except Exception:
+                    pass
+                # Do NOT set _request_cancelled — that swallows the error in the
+                # worker. Close the client so the worker surfaces a transport
+                # error; the skip-retry path then escalates to outer fallback.
+                last_chunk_time["t"] = time.time()
+                agent._emit_wait_notice(
+                    f"⚠ no first token for {int(_stale_elapsed)}s — failing over…"
+                )
+                agent._touch_activity(
+                    f"ttfb stale {int(_stale_elapsed)}s, failover"
+                )
+                continue
+
             agent._buffer_status(
                 f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                 f"(model: {api_kwargs.get('model', 'unknown')}, "

@@ -5719,6 +5719,17 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                    else:
+                        logger.warning(
+                            "No pending fallback at max retries "
+                            "(index=%s chain_len=%s activated=%s provider=%s model=%s err=%s)",
+                            getattr(agent, "_fallback_index", None),
+                            len(getattr(agent, "_fallback_chain", None) or []),
+                            getattr(agent, "_fallback_activated", None),
+                            _provider,
+                            _model,
+                            type(api_error).__name__,
+                        )
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -5726,6 +5737,14 @@ def run_conversation(
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
+                    logger.warning(
+                        "try_activate_fallback returned False at max retries "
+                        "(index=%s chain_len=%s provider=%s model=%s)",
+                        getattr(agent, "_fallback_index", None),
+                        len(getattr(agent, "_fallback_chain", None) or []),
+                        _provider,
+                        _model,
+                    )
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)

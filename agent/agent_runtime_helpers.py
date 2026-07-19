@@ -1731,6 +1731,10 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
+        # Allow previously-failed fallback entries to be tried again next turn
+        # (e.g. Qwen marked unavailable mid-session must not stick forever).
+        if hasattr(agent, "_unavailable_fallback_keys"):
+            agent._unavailable_fallback_keys = set()
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
