@@ -1278,6 +1278,17 @@ def try_recover_primary_transport(
     if error_type not in _TRANSIENT_TRANSPORT_ERRORS:
         return False
 
+    # ReadTimeout with a pending fallback chain is typically a capacity/queue
+    # wait (local vLLM slots full), not a stale connection pool. Rebuilding the
+    # primary client cannot free engine slots — skip recovery so the caller
+    # activates fallback_providers immediately.
+    if error_type == "ReadTimeout" and agent._has_pending_fallback():
+        _ra().logger.info(
+            "Skipping primary transport recovery for ReadTimeout — "
+            "fallback chain available (capacity overflow path)"
+        )
+        return False
+
     # Skip for aggregator providers — they manage their own retry infra
     if agent._is_openrouter_url():
         return False

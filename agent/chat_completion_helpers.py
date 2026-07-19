@@ -4051,6 +4051,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
+                    # Zero-byte / pre-first-token failures on a provider with a configured
+                    # fallback chain are almost always capacity/queue waits (vLLM
+                    # max_num_seqs full) or an intentional stale-stream kill — not
+                    # flaky TCP. Reconnecting to the same overloaded engine 3× just
+                    # burns wall-clock and never reaches fallback_providers.
+                    if (
+                        (_is_timeout or _is_conn_err)
+                        and not deltas_were_sent["yes"]
+                        and agent._has_pending_fallback()
+                    ):
+                        logger.info(
+                            "Pre-first-token %s with fallback chain available — "
+                            "skipping stream retries so outer loop can fail over",
+                            type(e).__name__,
+                        )
+                        result["error"] = e
+                        return
+
                     # If the stream died AFTER some tokens were delivered:
                     # normally we don't retry (the user already saw text,
                     # retrying would duplicate it).  BUT: if a tool call
@@ -4326,11 +4344,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     # Provider-configured stale timeout takes priority over env default.
+    # When the operator set an EXPLICIT provider/model stale_timeout_seconds
+    # (e.g. DeepSeek queue tripwire of 5s), honor it as a hard value — do NOT
+    # raise it via large-context scaling or the reasoning-model floor. Those
+    # floors exist to protect default 180s chat thresholds; applying them on
+    # top of an intentional short tripwire defeats capacity overflow fallback
+    # (deepseek-v4-flash alone carries a 600s reasoning floor).
     _cfg_stale = get_provider_stale_timeout(
         agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
     )
     if _cfg_stale is not None:
-        _stream_stale_timeout_base = _cfg_stale
+        _stream_stale_timeout = _cfg_stale
+        logger.debug(
+            "Using explicit provider stale_timeout_seconds=%.0fs (no context/reasoning floor)",
+            _stream_stale_timeout,
+        )
     else:
         _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
@@ -4374,18 +4402,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         elif _est_tokens > 50_000:
             _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
         else:
-            _stream_stale_timeout = _stream_stale_timeout_base
-        # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
-        # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
-        # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
-        # model threshold during their thinking phase.  The cloud gateway
-        # upstream kills the socket first, surfacing as BrokenPipeError.
-        # Raises the floor only — never overrides explicit user config
-        # (handled by get_provider_stale_timeout above).
-        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-        _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
-        if _reasoning_floor is not None:
-            _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+            # Scale the stale timeout for large contexts: slow models (like Opus)
+            # can legitimately think for minutes before producing the first token
+            # when the context is large.  Without this, the stale detector kills
+            # healthy connections during the model's thinking phase, producing
+            # spurious RemoteProtocolError ("peer closed connection").
+            _est_tokens = estimate_request_context_tokens(api_kwargs)
+            if _est_tokens > 100_000:
+                _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+            elif _est_tokens > 50_000:
+                _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+            else:
+                _stream_stale_timeout = _stream_stale_timeout_base
+            # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
+            # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
+            # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
+            # model threshold during their thinking phase.  The cloud gateway
+            # upstream kills the socket first, surfacing as BrokenPipeError.
+            # Raises the floor only — never applied when the operator set an
+            # explicit provider stale_timeout_seconds (branch above).
+            from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+            _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
+            if _reasoning_floor is not None:
+                _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()

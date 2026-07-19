@@ -824,6 +824,9 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                # Inherit parent's overflow chain so bg-review waiters bounce
+                # to Nemotron/etc. instead of hanging on a full primary engine.
+                fallback_model=list(getattr(agent, "_fallback_chain", None) or []) or None,
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
