@@ -2900,8 +2900,12 @@ class ContextCompressor(ContextEngine):
         # rough baseline without a matching real reading would shrink
         # apparent growth and defer on stale data — the unsafe direction.
         growth = max(0, rough_tokens - baseline)
-        projected_real = self.last_real_prompt_tokens + growth
-        return projected_real < self.threshold_tokens
+        tolerated_growth = max(1024, int(self.threshold_tokens * 0.01))
+        if growth > tolerated_growth:
+            return False
+
+        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
+        return True
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -4246,9 +4250,18 @@ This compaction should PRIORITISE preserving all information related to the focu
             # str-shaped message; coerce defensively instead of crashing.
             message = response.choices[0].message
             if isinstance(message, dict):
-                content = message.get("content")
+                content = message.get("content") or message.get("reasoning_content")
             else:
                 content = getattr(message, "content", message)
+                # Some OpenAI-compatible backends (Qwen thinking models, DeepSeek R1)
+                # return their output in ``reasoning_content`` (or an empty string in
+                # ``content``). Fall back to ``reasoning_content`` so those models
+                # produce a usable summary instead of triggering the "empty content"
+                # RuntimeError and setting a compression-failure cooldown (#15892).
+                if not content or not isinstance(content, str) or not content.strip():
+                    rc = getattr(message, "reasoning_content", None)
+                    if rc and isinstance(rc, str) and rc.strip():
+                        content = rc
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""

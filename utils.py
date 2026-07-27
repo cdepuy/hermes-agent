@@ -208,7 +208,7 @@ def atomic_json_write(
     data: Any,
     *,
     indent: int = 2,
-    mode: int | None = None,
+    mode: Union[int, None] = None,
     **dump_kwargs: Any,
 ) -> None:
     """Write JSON data to a file atomically.

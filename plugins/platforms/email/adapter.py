@@ -548,7 +548,13 @@ class EmailAdapter(BasePlatformAdapter):
         # has already chosen to accept any sender, so the check is moot and the
         # gate below is skipped.
         if "require_authenticated_sender" in extra:
-            self._require_authenticated_sender = bool(extra["require_authenticated_sender"])
+            raw = extra["require_authenticated_sender"]
+            if isinstance(raw, bool):
+                self._require_authenticated_sender = raw
+            elif isinstance(raw, str):
+                self._require_authenticated_sender = raw.lower() in ("true", "1", "yes")
+            else:
+                self._require_authenticated_sender = bool(raw)
         elif _esecret_bool("EMAIL_TRUST_FROM_HEADER", False):
             self._require_authenticated_sender = False
         else:
@@ -564,12 +570,66 @@ class EmailAdapter(BasePlatformAdapter):
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
+        # iCloud IMAP marks all messages as \\Seen on delivery, so UNSEEN
+        # searches find nothing.  Track the highest known UID instead and
+        # search for UIDs above it on each poll.
+        self._highest_uid: int = 0
         self._poll_task: Optional[asyncio.Task] = None
 
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
 
-        logger.info("[Email] Adapter initialized for %s", self._address)
+        logger.info(
+            "[Email] Adapter initialized for %s (require_authenticated_sender=%s, trust_from_header=%s)",
+            self._address,
+            self._require_authenticated_sender,
+            env_bool("EMAIL_TRUST_FROM_HEADER", False),
+        )
+
+    @staticmethod
+    def _extract_raw_email_from_response(msg_data: List[Any]) -> Optional[bytes]:
+        """Extract raw email bytes from an IMAP UID FETCH response.
+
+        IMAP ``UID FETCH`` responses vary by server:
+          - Standard: ``[(b'... (RFC822 ...)', b'raw email bytes')]``
+          - iCloud (\\Seen): ``[b'71 (UID 501)']`` (status line only)
+          - cPanel/HostGator: ``[(b'5 (UID 5 RFC822 {N}', b'raw email bytes'), b')']``
+        """
+        if not msg_data:
+            return None
+        candidates: list[bytes] = []
+        for item in msg_data:
+            if isinstance(item, tuple):
+                for element in item:
+                    if isinstance(element, (bytes, bytearray)) and len(element) > 100:
+                        # The email content is the large payload; filter out
+                        # short status-line metadata like "5 (UID 5 RFC822 {6016}"
+                        candidates.append(element)
+            elif isinstance(item, (bytes, bytearray)):
+                if len(item) > 100:
+                    candidates.append(item)
+        if not candidates:
+            return None
+        # Return the longest candidate — the actual email body, not the
+        # IMAP status line that happens to also be bytes with len > 20.
+        return max(candidates, key=len)
+
+    def _fetch_raw_email(self, imap: imaplib.IMAP4, uid: bytes) -> Optional[bytes]:
+        """Fetch raw email bytes for *uid*, trying (RFC822) then (BODY.PEEK[]).
+
+        On iCloud, already-SEEN messages return only a status line for
+        (RFC822).  (BODY.PEEK[]) provides the full payload without marking
+        the message as SEEN.
+        """
+        status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+        if status == "OK":
+            raw = self._extract_raw_email_from_response(msg_data)
+            if raw is not None:
+                return raw
+        status2, msg_data2 = imap.uid("fetch", uid, "(BODY.PEEK[])")
+        if status2 == "OK":
+            return self._extract_raw_email_from_response(msg_data2)
+        return None
 
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
@@ -670,16 +730,26 @@ class EmailAdapter(BasePlatformAdapter):
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
             imap.login(self._address, self._password)
             _send_imap_id(imap)
-            # Mark all existing messages as seen so we only process new ones
             imap.select("INBOX")
+            # Track the highest UID so poll searches for UIDs above it.
+            # iCloud marks all emails as \Seen on delivery, so UNSEEN-based
+            # searches would find nothing.  UID-based tracking catches every
+            # new message regardless of flag state.
             status, data = imap.uid("search", None, "ALL")
-            if status == "OK" and data and data[0]:
-                for uid in data[0].split():
-                    self._seen_uids.add(uid)
-            # Keep only the most recent UIDs to prevent unbounded growth
+            all_uids = data[0].split() if status == "OK" and data and data[0] else []
+            if all_uids:
+                self._highest_uid = int(all_uids[-1])
+            # Seed _seen_uids with just the highest UID so the first poll
+            # only catches messages above it.  Do NOT pre-populate every UID,
+            # otherwise emails that arrived before restart get silently skipped.
+            if not self._seen_uids and all_uids:
+                self._seen_uids.add(all_uids[-1])
             self._trim_seen_uids()
             imap.logout()
-            logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
+            logger.info(
+                "[Email] IMAP connection test passed. %d existing messages skipped (highest UID: %s).",
+                len(self._seen_uids), self._highest_uid,
+            )
         except Exception as e:
             logger.error("[Email] IMAP connection failed: %s", e)
             return False
@@ -733,7 +803,14 @@ class EmailAdapter(BasePlatformAdapter):
             await self._dispatch_message(msg_data)
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
-        """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
+        """Fetch new messages from IMAP using UID range tracking.
+
+        iCloud marks all emails as \\Seen on delivery, so searching for UNSEEN
+        finds nothing.  Instead we track the highest seen UID and search for
+        UIDs above it on each poll.  Runs in executor thread.
+        """
+        import traceback
+        print(f"[DEBUG POLL] _fetch_new_messages called at {__import__('time').strftime('%H:%M:%S')}", flush=True)
         results = []
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
@@ -742,41 +819,53 @@ class EmailAdapter(BasePlatformAdapter):
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
-                status, data = imap.uid("search", None, "UNSEEN")
-                if status != "OK" or not data or not data[0]:
+                # Search for UIDs greater than the highest we've seen.
+                # Also search UNSEEN as a secondary strategy — this catches
+                # emails that arrived before a gateway restart (the connect()
+                # ALL scan sets _highest_uid past them, so UID-range search
+                # alone would miss them until the next restart).
+                highest = self._highest_uid
+                search_results = set()
+                search_criteria = f"UID {highest + 1}:*" if highest > 0 else "ALL"
+                status, data = imap.uid("search", None, search_criteria)
+                if status == "OK" and data and data[0]:
+                    for uid_b in data[0].split():
+                        search_results.add(uid_b)
+                status2, data2 = imap.uid("search", None, "UNSEEN")
+                if status2 == "OK" and data2 and data2[0]:
+                    for uid_b in data2[0].split():
+                        search_results.add(uid_b)
+                if not search_results:
+                    logger.debug("[Email] Poll search returned nothing")
                     return results
-
-                for uid in data[0].split():
+                sorted_uids = sorted(search_results, key=lambda x: int(x))
+                for uid_bytes in sorted_uids:
+                    uid = uid_bytes  # bytes
+                    uid_int = int(uid)
+                    if uid_int <= highest:
+                        logger.debug("[Email] Poll skipping %s (<= highest=%s)", uid_int, highest)
+                        continue
                     if uid in self._seen_uids:
+                        logger.debug("[Email] Poll skipping %s (already in _seen_uids)", uid_int)
                         continue
                     self._seen_uids.add(uid)
+                    if uid_int > self._highest_uid:
+                        self._highest_uid = uid_int
                     # Trim periodically to prevent unbounded memory growth
                     if len(self._seen_uids) > self._seen_uids_max:
                         self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
-                    if status != "OK":
-                        continue
-
-                    # IMAP fetch can return unexpected structures (e.g. a
-                    # single bytes item instead of a list of tuples). Guard
-                    # against IndexError / TypeError so one malformed response
-                    # doesn't abort the batch — the UID is already in
-                    # _seen_uids, so an abort would permanently skip the
-                    # remaining messages in this batch.
-                    try:
-                        raw_email = msg_data[0][1]
-                    except (IndexError, TypeError):
+                    # iCloud IMAP returns just the status line for (RFC822) on
+                    # already-SEEN messages.  Try (RFC822) first, then fall back
+                    # to (BODY.PEEK[]) which returns the full payload.
+                    raw_email = self._fetch_raw_email(imap, uid)
+                    if raw_email is None:
                         logger.warning(
-                            "[Email] Unexpected IMAP response structure for UID %s, skipping",
+                            "[Email] Could not extract payload for UID %s, skipping",
                             uid,
                         )
                         continue
-                    if not isinstance(raw_email, (bytes, bytearray)):
-                        logger.warning(
-                            "[Email] Non-bytes IMAP payload for UID %s, skipping", uid
-                        )
-                        continue
+                    logger.debug("[Email] Fetched %d bytes for UID %s", len(raw_email), uid_int)
                     msg = email_lib.message_from_bytes(raw_email)
 
                     sender_raw = msg.get("From", "")
