@@ -2534,7 +2534,7 @@ def init_agent(
             protect_first_n=compression_protect_first,
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
-            summary_model_override=None,
+            summary_model_override=_aux_cfg.get("model") or agent.model,
             quiet_mode=agent.quiet_mode,
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),
