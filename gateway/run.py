@@ -18891,6 +18891,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # Collect MEDIA paths already in history so we can exclude them
+            # from the current turn's extraction. This is compression-safe:
+            # even if the message list shrinks, we know which paths are old.
+            _history_media_paths: set = _collect_history_media_paths(history)
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).

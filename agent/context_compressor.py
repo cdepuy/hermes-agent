@@ -4194,19 +4194,36 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "api_mode": self.api_mode,
                 },
                 "messages": [{"role": "user", "content": prompt}],
-                # NO max_tokens: the output cap must never truncate a summary.
-                # ``summary_budget`` is prompt-level guidance only ("Target ~N
-                # tokens" above). Most OpenAI-compatible wires already omit the
-                # param (see _build_call_kwargs), but the Anthropic Messages
-                # wire and NVIDIA NIM forward it — a hard cap there cut
-                # summaries mid-section (thinking models burn the cap on
-                # reasoning first), producing truncated/thinking-only
-                # summaries and compaction loops. Omitting lets the adapter
+                # NO max_tokens by default: the output cap must never truncate a
+                # summary.  ``summary_budget`` is prompt-level guidance only
+                # ("Target ~N tokens" above).  Most OpenAI-compatible wires
+                # already omit the param (see _build_call_kwargs), but the
+                # Anthropic Messages wire and NVIDIA NIM forward it — a hard cap
+                # there cut summaries mid-section (thinking models burn the cap
+                # on reasoning first), producing truncated/thinking-only
+                # summaries and compaction loops.  Omitting lets the adapter
                 # fall back to the model's native output ceiling.
+                #
+                # A max_tokens kwarg is injected *below* when the summarizer is
+                # falling back to the main model (no dedicated aux provider).
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
+
+            # ── Conditionally apply summarizer output cap ──────────────────
+            # When the compression summarizer falls back to the main model
+            # (no dedicated aux provider, or provider=custom fallback), cap
+            # its output at self.max_tokens (the configured model.max_tokens,
+            # e.g. 32000) so it never requests 65K output from a model already
+            # near its context ceiling.  When a dedicated auxiliary provider
+            # is in use (not fallback), leave max_tokens unset so the full
+            # output budget is available for thorough summaries.
+            _fallback_to_main = not self.summary_model or getattr(
+                self, "provider", ""
+            ) == "custom"
+            if _fallback_to_main and self.max_tokens is not None:
+                call_kwargs["max_tokens"] = self.max_tokens
             _aux_provider = ""
             _aux_model = self.summary_model or ""
             _aux_context = None

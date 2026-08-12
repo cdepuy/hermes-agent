@@ -5125,25 +5125,38 @@ def run_conversation(
                         # bound.  Also estimate the current API request shape
                         # (system prompt, injected context, tool schemas) because
                         # Hermes may add API-only content not present in persisted
-                        # messages.  Use the smaller budget and apply a small
-                        # safety margin.  Do not alter context_length.
+                        # messages.  Apply a small safety margin.  Do not alter
+                        # context_length.
+                        #
+                        # ── Aggressive max_tokens reduction ──────────────────
+                        # The old -64-per-retry approach requires ~500 attempts
+                        # to drop from 65K to 32K — far more than any configured
+                        # max_compression_attempts.  Jump directly to the
+                        # configured model.max_tokens (or the provider-reported
+                        # available budget) on the FIRST retry, with a small
+                        # safety margin.  This prevents the death spiral where
+                        # compression fails 3+ times before giving up.
+                        # (#43547)
+                        configured_max = getattr(agent, "max_tokens", None) or 4096
                         request_input_estimate = estimate_request_tokens_rough(
                             api_messages, tools=agent.tools or None,
                         )
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
-                            safe_out = max(1, min(available_out, local_available_out) - 64)
+                            _budget = min(available_out, local_available_out)
                         else:
                             # The rough local estimate can overshoot the real
                             # request size.  Fall back to the provider-reported
                             # budget, which is authoritative for the failed
                             # request.
-                            safe_out = max(1, available_out - 64)
+                            _budget = available_out
+                        safe_out = max(1, min(_budget, configured_max) - 64)
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "
                             f"retrying with max_tokens={safe_out:,} "
                             f"(provider_available={available_out:,}, "
+                            f"configured_max={configured_max:,}, "
                             f"estimated_request_tokens={request_input_estimate:,}; "
                             f"context_length unchanged at {old_ctx:,})"
                         )

@@ -28,6 +28,7 @@ import socket
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
 import ssl
+import time
 import uuid
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
@@ -110,6 +111,167 @@ _AUTOMATED_HEADERS = {
 MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
+
+# ──────────────────────────────────────────────────────────────────────────
+# Email → writer-cron routing (whitepaper / blog request detection)
+#
+# The gateway email adapter dispatches every authorized email as a generic
+# conversational MessageEvent. For wholesale content requests ("write a
+# whitepaper …", "write a blog …") we instead route to the dedicated on-demand
+# writer cron, which runs the full gated workflow (research → draft → mandatory
+# peer review → mandatory pre-publishing audit → PDF) and emails the finished
+# result back to the ORIGINAL sender. This restores the deterministic
+# email→workflow trigger that was lost when the old `check_icloud_email.py`
+# cron was removed (Jul 22, 2026) in favour of the gateway adapter, which never
+# gained the routing half of the migration.
+#
+# Writer cron job ids:
+#   a94d3fb26ff7  Whitepaper Writer from Email
+#   3c1a6ee8bd49  Blog Writer from Email Request
+# ──────────────────────────────────────────────────────────────────────────
+
+_WHITEPAPER_KEYWORDS = (
+    "write a whitepaper", "make a whitepaper", "write a white paper",
+    "make a white paper", "write whitepaper", "write white paper",
+    "create a whitepaper", "create a white paper", "draft a whitepaper",
+    "draft a white paper", "new whitepaper", "new white paper",
+    "publish a whitepaper", "publish a white paper",
+)
+
+_BLOG_KEYWORDS = (
+    "write a blog", "make a blog", "draft a blog", "blog post", "post about",
+    "write about", "draft a post", "draft a post about", "new blog",
+    "write up", "publish a post", "write a post", "turn this into",
+)
+
+# How long (seconds) after a writer request fires that a follow-up reply from
+# the same sender is still treated as part of the writer flow rather than a
+# fresh/free-form conversation. Whitepapers/blogs take a while to generate, so
+# give the sender a generous window to confirm or refine.
+_WRITER_REPLY_WINDOW = 3 * 60 * 60  # 3 hours
+
+# Follow-up reply consent: the reply begins with an acknowledgment / consent
+# token, optionally followed by free-form trailing words (e.g. "yes, go
+# ahead", "ok sounds good", "sounds good, please interview Alan").  A reply
+# that does NOT lead with a consent token (e.g. "Actually can you feature
+# Nokia…") is treated as a fresh substantive message, not a consent follow-up.
+# A leading "no…" is deliberately excluded so an explicit refusal still needs
+# human judgment rather than a canned ack.
+_WRITER_CONSENT_RE = re.compile(
+    r"^\s*(yes|yeah|yep|yup|ok|okay|sure|go ahead|please do|please|do it|"
+    r"sounds? (good|great)|fine|great|perfect|thanks|thank you|correct|right|"
+    r"makes sense)[\w\s,.'!?()\u2013\u2014-]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_writer_follow_up(subject: str, body: str) -> bool:
+    """True if *subject*+*body* look like a short reply to a writer request.
+
+    Used to keep a bare "yes" (or similar) from falling into the generic
+    conversational agent after a whitepaper/blog request was just fired for
+    this sender — it belongs to the writer flow.
+
+    The subject is normally a quoted ``Re: <original>`` line, so it is noise
+    for a consent check; evaluate the *body* (the actual reply text) first,
+    and only fall back to the subject-minus-``Re:`` prefix when the body is
+    empty.
+    """
+    # Body is the real reply content; ignore any surrounding quote/citation.
+    candidate = body.strip()
+    if not candidate:
+        # No body — fall back to the subject with a leading Re:/Fwd: stripped.
+        candidate = re.sub(r"^\s*(re|fwd|fw):\s*", "", subject.strip(), flags=re.IGNORECASE)
+    candidate = candidate.strip()
+    if not candidate:
+        return False
+    # A re-reply that re-states a full request is handled by _detect_content_request,
+    # so here we only care about short, non-content consent/acknowledge replies.
+    return bool(_WRITER_CONSENT_RE.match(candidate))
+
+
+_WHITEPAPER_WRITER_JOB = "a94d3fb26ff7"
+_BLOG_WRITER_JOB = "3c1a6ee8bd49"
+
+
+def _detect_content_request(text: str) -> Optional[str]:
+    """Return 'whitepaper' / 'blog' if *text* is a content request, else None.
+
+    Text is the subject + body (lowercased). Whitepaper detection wins if both
+    patterns match, since a whitepaper supersedes a blog framing.
+    """
+    low = (" " + text + " ").lower()
+    # Normalize "white paper" → "whitepaper" so one keyword set covers both
+    # spellings cleanly.
+    low = low.replace("white paper", "whitepaper")
+    for kw in _WHITEPAPER_KEYWORDS:
+        if kw in low:
+            return "whitepaper"
+    for kw in _BLOG_KEYWORDS:
+        if kw in low:
+            return "blog"
+    return None
+
+
+def _fire_writer_cron(job_id: str, *, sender_addr: str, subject: str, body: str) -> bool:
+    """FIRE the writer cron for *job_id* and stage its trigger line.
+
+    Mirrors the retired `fire_writer_job()` subprocess pattern: write the
+    [WHITEPAPER]/[BLOG] trigger line (with the sender's address) so the fired
+    cron can parse it, then launch ``hermes cron run <job>`` in a detached
+    background subprocess so polling is never blocked.
+
+    Returns True if the subprocess was launched.
+    """
+    import subprocess
+    from datetime import datetime
+
+    trigger_file = None
+    prefix = None
+    data_dir = os.path.expanduser("~/.hermes/data")
+    if job_id == _WHITEPAPER_WRITER_JOB:
+        trigger_file = os.path.join(data_dir, "whitepaper_triggers.txt")
+        prefix = "WHITEPAPER"
+    elif job_id == _BLOG_WRITER_JOB:
+        trigger_file = os.path.join(data_dir, "blog_triggers.txt")
+        prefix = "BLOG"
+
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        if trigger_file and prefix:
+            # Canonical trigger format the writer cron parses:
+            #   [WHITEPAPER] Name (email@addr): subject
+            # We don't have the sender's display name here, so reuse the address
+            # as the name token and carry the address in parens for the parser.
+            line = f"[{prefix}] {sender_addr} ({sender_addr}): {subject}\n"
+            with open(trigger_file, "a", encoding="utf-8") as f:
+                f.write(line)
+            logger.info("[Email→cron] Staged %s trigger: %s", prefix, subject)
+    except Exception as e:  # noqa: BLE001 — trigger staging is best-effort
+        logger.error("[Email→cron] Failed to write trigger file: %s", e)
+
+    # Detached background subprocess so the gateway poll loop is not blocked.
+    # --accept-hooks avoids a TTY prompt on any shell hooks during the run.
+    # NOTE: `hermes cron run` takes ONLY job_id (plus --accept-hooks). Passing
+    # extra positional args (`-- sender subject`) made every invocation fail with
+    # "unrecognized arguments" and silently killed the run (seen live: file was
+    # staged, log claimed "Fired", but 0 executions — writer cron never ran).
+    # The generator reads sender/subject from the trigger file, so nothing
+    # further needs to be passed on the CLI.
+    try:
+        subprocess.Popen(
+            ["hermes", "cron", "run", job_id, "--accept-hooks"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        logger.info("[Email→cron] Fired writer cron %s for %s", job_id, sender_addr)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.error("[Email→cron] Failed to fire writer cron %s: %s", job_id, e)
+        return False
+
 
 
 def _create_ipv4_connection(
@@ -578,6 +740,13 @@ class EmailAdapter(BasePlatformAdapter):
 
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
+
+        # Map chat_id (sender email) -> in-flight writer request metadata, so a
+        # follow-up reply ("yes", acknowledgment, short refinement) on an
+        # already-fired whitepaper/blog is kept in the writer flow instead of
+        # landing in the generic conversational agent.  Populated when a writer
+        # cron fires; entries expire after _WRITER_REPLY_WINDOW.
+        self._pending_writer: Dict[str, Dict[str, Any]] = {}
 
         logger.info(
             "[Email] Adapter initialized for %s (require_authenticated_sender=%s, trust_from_header=%s)",
@@ -1062,7 +1231,120 @@ class EmailAdapter(BasePlatformAdapter):
         )
 
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
+
+        # ── Writer-cron routing ──────────────────────────────────────────
+        # A wholesale "write a whitepaper/blog" request from an authorized,
+        # authenticated sender is routed to the dedicated writer cron (which
+        # runs the full gated workflow and emails the result back to this same
+        # sender) instead of being handled as a generic conversational message.
+        detected = _detect_content_request(subject + " " + body)
+        if detected == "whitepaper":
+            fired = _fire_writer_cron(
+                _WHITEPAPER_WRITER_JOB,
+                sender_addr=sender_addr,
+                subject=subject,
+                body=body,
+            )
+            if fired:
+                self._pending_writer[sender_addr] = {
+                    "kind": "whitepaper",
+                    "topic": subject,
+                    "job_id": _WHITEPAPER_WRITER_JOB,
+                    "fired_at": time.time(),
+                }
+                await self.send(
+                    sender_addr,
+                    "Thanks — I've received your whitepaper request and started the "
+                    "650 Group whitepaper workflow for it (research → draft → peer "
+                    "review → audit → PDF). I'll email the finished PDF back here.\n\n"
+                    "If you'd like to steer the project — angle, forecast horizon, "
+                    "vendors to feature — reply now with your notes (or just an "
+                    "invitation to interview you or Alan) and I'll fold them in while "
+                    "the draft is still being written.",
+                )
+                return
+            # Fall through to conversational dispatch if firing failed.
+        elif detected == "blog":
+            fired = _fire_writer_cron(
+                _BLOG_WRITER_JOB,
+                sender_addr=sender_addr,
+                subject=subject,
+                body=body,
+            )
+            if fired:
+                self._pending_writer[sender_addr] = {
+                    "kind": "blog",
+                    "topic": subject,
+                    "job_id": _BLOG_WRITER_JOB,
+                    "fired_at": time.time(),
+                }
+                await self.send(
+                    sender_addr,
+                    "Thanks — I've received your blog request and started the 650 Group "
+                    "blog workflow (research → draft → image → WordPress draft → peer "
+                    "review → audit). I'll email the admin edit link back here when it's ready.",
+                )
+                return
+            # Fall through to conversational dispatch if firing failed.
+
+        # ── Writer follow-up routing ────────────────────────────────────
+        # A short reply from a sender with an in-flight writer request — e.g. a
+        # bare "yes" acknowledging the confirmation — belongs to that writer
+        # flow, not to the generic conversational agent.  Intercept it here so
+        # it gets a writer-aware ack ("your notes will be / have been folded
+        # in") instead of hollow generic waffle.
+        pending = self._pending_writer.get(sender_addr)
+        if (
+            pending
+            and time.time() - pending.get("fired_at", 0) <= _WRITER_REPLY_WINDOW
+            and _is_writer_follow_up(subject, body)
+        ):
+            await self._handle_writer_follow_up(sender_addr, pending, subject, body)
+            return
+
         await self.handle_message(event)
+
+    async def _handle_writer_follow_up(
+        self,
+        sender_addr: str,
+        pending: Dict[str, Any],
+        subject: str,
+        body: str,
+    ) -> None:
+        """Acknowledge a follow-up reply on an in-flight writer request.
+
+        Keeps the reply inside the writer flow: no generic-agent waffle, no
+        duplicate cron fire (the workflow for *pending["job_id"]* is already
+        running).  The sender's reply is appended to the trigger file so the
+        running workflow can optionally fold it in; the sender is told the
+        finished result will still arrive here.
+        """
+        kind = pending.get("kind", "whitepaper")
+        topic = (pending.get("topic") or subject or "your request").strip()
+        note = (subject + " " + body).strip()
+        if note:
+            # Record the follow-up so a running/queued workflow can see it.
+            try:
+                data_dir = os.path.expanduser("~/.hermes/data")
+                suffix = "whitepaper_triggers.txt" if kind == "whitepaper" else "blog_triggers.txt"
+                path = os.path.join(data_dir, suffix)
+                os.makedirs(data_dir, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"[FOLLOWUP {kind.upper()}] {sender_addr}: {note}\n")
+                logger.info(
+                    "[Email→cron] Recorded %s follow-up from %s on in-flight %s (%s)",
+                    kind, sender_addr, kind, topic,
+                )
+            except Exception as e:  # noqa: BLE001 — best-effort
+                logger.error("[Email→cron] Failed to record follow-up: %s", e)
+        noun = "whitepaper" if kind == "whitepaper" else "blog post"
+        await self.send(
+            sender_addr,
+            f"Got it — thanks for confirming on the {noun} (\"{topic}\"). "
+            f"Your notes are noted and will be folded in while the draft is in "
+            f"progress; the finished {noun} will still arrive back here when "
+            f"peer review and the pre-publishing audit complete.",
+        )
 
     async def send(
         self,

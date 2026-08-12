@@ -15869,6 +15869,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """
             event.current_buffer.insert_text('\n')
 
+        if sys.platform == "darwin":
+            # macOS Apple Terminal intercepts Alt+Enter and Ctrl+Enter
+            # for various window management actions. Register both
+            # Ctrl+J (raw LF) and F6 (no default Hermes binding) as
+            # unconditional newline keys so the user always has a
+            # working option.
+            @kb.add('c-j')
+            def handle_macos_newline(event):
+                event.current_buffer.insert_text('\n')
+            @kb.add('f6')
+            def handle_f6_newline(event):
+                event.current_buffer.insert_text('\n')
+
         if _preserve_ctrl_enter_newline():
             @kb.add('c-j')
             def handle_ctrl_enter_newline(event):
